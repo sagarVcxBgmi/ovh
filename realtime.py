@@ -8,7 +8,7 @@ BOT_TOKEN = '7801992252:AAEVyldGbrwIPuvuGNLfyIOMb6dSkfH83j8'
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Replace with your Telegram User ID (owner)
-OWNER_ID = 6442837812
+OWNER_ID = 6191432888
 
 # Global flag and thread reference for monitoring
 monitoring = False
